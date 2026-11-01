@@ -7,8 +7,10 @@ import {MockSQK, MockSqueekNFT, MockEmission, MockStaking} from "../mocks/MockSq
 
 /// @dev Closed actor universe, explicit ghost custody and cash flows. No storage writes to the vault.
 /// Deposits and successful merges use only the observed L1/L2 curve. Higher synthetic levels
-/// are covered separately in ReserveDependenciesTest. Failed claims are deliberately reachable;
-/// conservation does not imply fair ownership of delayed rewards (see the reported finding).
+/// are covered separately in ReserveDependenciesTest. Failed claims are deliberately reachable:
+/// while SQK is claimable for the vault and the claim fails, every share balance change must be
+/// refused (`RewardsUnsettled`), and an independent per-holder entitlement oracle checks that
+/// delayed rewards still go to the holders of record when they accrued.
 contract ReserveHandler is Test {
     HamsterMiningReserve public immutable vault;
     MockSQK public immutable sqk;
@@ -36,6 +38,13 @@ contract ReserveHandler is Test {
     uint256 public successfulMerges;
     uint256 public rejectedMerges;
     uint256 public rejectedUnauthorized;
+    uint256 public frozenRejections;
+    uint256 public strandedStakes;
+    /// @dev SQK each holder is owed, computed from balances at the moment the SQK reached the
+    ///      staking contract or the vault. Independent of the vault's index arithmetic.
+    mapping(address => uint256) public entitled;
+    /// @dev SQK each holder has claimed (to any recipient).
+    mapping(address => uint256) public claimedBy;
 
     constructor(
         HamsterMiningReserve v,
@@ -53,6 +62,20 @@ contract ReserveHandler is Test {
         strategist = strategist_;
         for (uint256 i; i < 4; ++i) {
             actors[i] = makeAddr(string.concat("invariant actor ", vm.toString(i)));
+        }
+    }
+
+    /// @dev True exactly when `_settle` would return false in the mock graph: the claim reverts
+    ///      while SQK is still claimable for the vault.
+    function frozen() public view returns (bool) {
+        return staking.revertOnClaim() && staking.claimable(address(vault)) != 0;
+    }
+
+    function _credit(uint256 amount) internal {
+        uint256 supply = vault.totalSupply();
+        if (supply == 0 || amount == 0) return;
+        for (uint256 i; i < 4; ++i) {
+            entitled[actors[i]] += (amount * vault.balanceOf(actors[i])) / supply;
         }
     }
 
@@ -76,6 +99,18 @@ contract ReserveHandler is Test {
         uint256 supplyBefore = vault.totalSupply();
         vm.startPrank(actor);
         nft.setApprovalForAll(address(vault), true);
+        if (frozen()) {
+            vm.expectRevert(HamsterMiningReserve.RewardsUnsettled.selector);
+            vault.deposit(ids);
+            vm.stopPrank();
+            assertEq(vault.totalSupply(), supplyBefore);
+            assertEq(vault.totalPower(), powerBefore);
+            for (uint256 i; i < count; ++i) {
+                assertEq(nft.ownerOf(ids[i]), actor, "frozen deposit must not take the NFT");
+            }
+            ++frozenRejections;
+            return;
+        }
         uint256 shares = vault.deposit(ids);
         vm.stopPrank();
         assertGt(shares, 0);
@@ -111,6 +146,16 @@ contract ReserveHandler is Test {
         else if (amountSeed % 4 == 2) amount = balance;
         else if (amountSeed % 4 == 3) amount = bound(amountSeed, 0, balance);
         uint256 supplyBefore = vault.totalSupply();
+        if (frozen()) {
+            uint256 toBefore = vault.balanceOf(to);
+            vm.prank(from);
+            vm.expectRevert(HamsterMiningReserve.RewardsUnsettled.selector);
+            vault.transfer(to, amount);
+            assertEq(vault.balanceOf(from), balance);
+            assertEq(vault.balanceOf(to), toBefore);
+            ++frozenRejections;
+            return;
+        }
         if (delegated) {
             address spender = actors[(fromSeed % 4 + 1) % 4];
             vm.prank(from);
@@ -133,12 +178,14 @@ contract ReserveHandler is Test {
         if (donation) sqk.mint(address(vault), amount);
         else staking.fund(address(vault), amount);
         rewardsInjected += amount;
+        _credit(amount);
     }
 
     function tinyAccrual(uint8 rewardSeed) external observed {
         uint256 amount = bound(rewardSeed, 1, 10);
         staking.fund(address(vault), amount);
         rewardsInjected += amount;
+        _credit(amount);
     }
 
     function harvest(bool usePoke) public observed {
@@ -160,6 +207,7 @@ contract ReserveHandler is Test {
         assertEq(vault.unclaimedRewards(holder), 0);
         rewardsPaid += paid;
         expectedReceipts[to] += paid;
+        claimedBy[holder] += paid;
         ++successfulClaims;
     }
 
@@ -184,6 +232,35 @@ contract ReserveHandler is Test {
         burned[donor] = true;
         ++mergedCount;
         ++successfulMerges;
+    }
+
+    /// @dev A Squeek pushed with a plain `transferFrom` (no receiver hook) is staked for the
+    ///      reserve by an arbitrary caller. Power rises, no shares are minted, it becomes mergeable.
+    function stranded(uint256 actorSeed, uint256 callerSeed, bool retry) public observed {
+        address actor = actors[actorSeed % 4];
+        address caller = actors[callerSeed % 4];
+        uint256 id = nft.mint(actor, 1);
+        vm.prank(actor);
+        nft.transferFrom(actor, address(vault), id);
+        uint256 supplyBefore = vault.totalSupply();
+        uint256 powerBefore = vault.totalPower();
+        uint256 countBefore = vault.heldCount();
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = id;
+        vm.prank(caller);
+        vault.stakeStranded(ids);
+        assertEq(vault.totalSupply(), supplyBefore);
+        assertEq(vault.totalPower(), powerBefore + 1000e18);
+        assertEq(vault.heldCount(), countBefore + 1);
+        if (retry) {
+            vm.prank(caller);
+            vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.NotStranded.selector, id));
+            vault.stakeStranded(ids);
+        }
+        depositedIds.push(id);
+        unmergedL1.push(id);
+        ++depositedCount;
+        ++strandedStakes;
     }
 
     function _removeL1(uint256 index) internal {

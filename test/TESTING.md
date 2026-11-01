@@ -92,15 +92,27 @@ probe, its RPC compatibility handling needs correction. Tests do not intercept t
 replace chain state, or suppress provider failures. The pinned fork and direct RPC checks
 must both pass.
 
+## Previously reported defect: fixed, now a regression property
+
+The earlier high finding (delayed rewards re-split after a claim outage) is fixed in the
+implementation: `_settle` reports failure when the claim reverts while SQK is still claimable,
+and `deposit`/`_update` then revert with `RewardsUnsettled`. The suite now proves the fix:
+
+- `invariant/ReserveHandler.sol` expects `RewardsUnsettled` for every deposit and transfer made
+  while frozen (claim down and SQK claimable), and checks that nothing moved.
+- An independent entitlement oracle credits each funding to holders by their balances at the
+  moment it accrued. `invariant_noHolderClaimsMoreThanTheirEntitlement` holds after every call,
+  and after recovery each holder's claims equal their entitlement to within rounding.
+  Reverting the fix locally makes the campaign fail, so the oracle is not vacuous.
+- `ReserveSettlement.t.sol` covers the settlement decision (claimable view reverting or returning
+  no data freezes; a claim that reverts only when nothing is owed does not), frozen zero/self/
+  delegated transfers, already-indexed payouts while frozen, a 1,000-run late-depositor fuzz,
+  `stakeStranded` edges (duplicate in batch, burned donor, before the first deposit, while frozen)
+  and ownership edges (renounce, cancelled handover, completed handover).
+- The handler also drives `stakeStranded` (plain-pushed NFTs staked by any actor, no shares).
+
 ## Reported defect
 
-`.imd-findings.json` contains one high-severity finding and its complete self-contained,
-offline Foundry reproduction. When staking claims temporarily fail, deposits and transfers
-still change share balances, and later recovery indexes previously earned rewards against
-those new balances. An equal-power late depositor takes half of a prior holder's 100 SQK;
-a full transfer moves all 100 SQK of old rewards to the recipient. Both expected-entitlement
-tests were run and failed on the unchanged implementation.
-
-The deliberately failing source is embedded in the report, not in the passing suite. It
-permits a fix either to reject the balance mutation during failed settlement or to preserve
-the old holder's entitlement while allowing the mutation. No production contract is changed.
+`.imd-findings.json` reports one low-severity gap: the freeze relies on `staking.claim`
+reverting. A claim that succeeds but leaves SQK claimable (pays nothing) counts as settled, so a
+later depositor shares SQK that accrued before they joined. Not asserted as correct anywhere.

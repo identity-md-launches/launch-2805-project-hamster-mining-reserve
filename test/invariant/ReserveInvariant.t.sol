@@ -19,7 +19,7 @@ contract ReserveInvariantTest is ReserveFixture {
             handler.deposit(i, 2);
         }
         handler.accrue(17e18, false);
-        bytes4[] memory selectors = new bytes4[](10);
+        bytes4[] memory selectors = new bytes4[](11);
         selectors[0] = handler.deposit.selector;
         selectors[1] = handler.transferShares.selector;
         selectors[2] = handler.accrue.selector;
@@ -30,6 +30,7 @@ contract ReserveInvariantTest is ReserveFixture {
         selectors[7] = handler.failedMerge.selector;
         selectors[8] = handler.unauthorizedMerge.selector;
         selectors[9] = handler.outage.selector;
+        selectors[10] = handler.stranded.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -45,6 +46,7 @@ contract ReserveInvariantTest is ReserveFixture {
         }
         assertEq(sum, vault.totalSupply());
         assertEq(sum, handler.sharesMinted());
+        // Every share was minted against power; stranded stakes and merges only add power.
         assertLe(sum, vault.totalPower());
         assertEq(vault.totalPower(), handler.depositedCount() * 1000e18 + handler.mergedCount() * 200e18);
         assertEq(vault.balanceOf(address(vault)), 0);
@@ -97,6 +99,15 @@ contract ReserveInvariantTest is ReserveFixture {
         assertLe(pending, vaultBalance + accrued);
     }
 
+    /// @dev Nobody, in any state, is owed less than they have already been paid (beyond dust):
+    ///      a holder can never claim SQK that accrued to someone else's balance.
+    function invariant_noHolderClaimsMoreThanTheirEntitlement() public view {
+        for (uint256 i; i < 4; ++i) {
+            address actor = handler.actors(i);
+            assertLe(handler.claimedBy(actor), handler.entitled(actor) + handler.actions() * 2 + 2);
+        }
+    }
+
     function afterInvariant() public {
         handler.recoverAndClaimAll();
         invariant_sharesAreConservedAndBackedByDepositedPower();
@@ -104,7 +115,16 @@ contract ReserveInvariantTest is ReserveFixture {
         invariant_allRewardCashIsConservedAndLiabilitiesAreCovered();
         assertEq(staking.claimable(address(vault)), 0);
         for (uint256 i; i < 4; ++i) {
-            assertEq(vault.pendingRewards(handler.actors(i)), 0);
+            address actor = handler.actors(i);
+            assertEq(vault.pendingRewards(actor), 0);
+            // After recovery every holder has received what accrued to their balance at the time,
+            // including SQK that was delayed by a claim outage. Tolerance: floor rounding only.
+            assertApproxEqAbs(
+                handler.claimedBy(actor),
+                handler.entitled(actor),
+                handler.actions() * 2 + 2,
+                "delayed reward misallocated"
+            );
         }
         // With < 1e27 shares each global-index truncation loses < 1 wei, and each
         // holder synchronization loses < 1 wei. A transfer synchronizes at most two holders.
@@ -124,16 +144,26 @@ contract ReserveInvariantTest is ReserveFixture {
         handler.unauthorizedMerge(2);
         handler.merge(0, 0, true);
         handler.merge(0, 0, false);
+        handler.stranded(1, 2, true);
+        handler.merge(0, 0, false);
         handler.outage(true, true);
-        handler.deposit(3, 1);
+        handler.deposit(3, 1); // nothing claimable yet: proceeds despite the outage
+        handler.accrue(5e18, false);
+        assertTrue(handler.frozen());
+        handler.deposit(3, 1); // SQK stuck in staking: refused
+        handler.transferShares(3, 0, 2, false, false); // refused
+        handler.claim(1, 1, false);
         handler.harvest(false);
         handler.outage(false, false);
+        assertFalse(handler.frozen());
         assertGt(handler.successfulDeposits(), 4);
         assertGt(handler.successfulTransfers(), 0);
         assertGt(handler.successfulClaims(), 0);
         assertGt(handler.successfulMerges(), 0);
         assertGt(handler.rejectedMerges(), 0);
         assertGt(handler.rejectedUnauthorized(), 0);
+        assertEq(handler.frozenRejections(), 2);
+        assertGt(handler.strandedStakes(), 0);
         afterInvariant();
     }
 }
