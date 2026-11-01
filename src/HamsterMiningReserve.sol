@@ -83,6 +83,7 @@ contract HamsterMiningReserve is ERC20, Ownable2Step, ReentrancyGuard, IERC721Re
     // ------------------------------------------------------------------ events
 
     event Deposited(address indexed depositor, uint256[] tokenIds, uint256 powerAdded, uint256 sharesMinted);
+    event StrandedStaked(address indexed caller, uint256[] tokenIds, uint256 powerAdded);
     event MergeStep(
         uint256 indexed survivor, uint256 indexed donor, uint256 newLevel, uint256 powerBefore, uint256 powerAfter
     );
@@ -104,10 +105,21 @@ contract HamsterMiningReserve is ERC20, Ownable2Step, ReentrancyGuard, IERC721Re
     error PowerDidNotIncrease(uint256 powerBefore, uint256 powerAfter);
     error NoPowerAdded();
     error UnexpectedNft(address operator, uint256 tokenId);
+    /// @dev SQK is claimable for the vault but `staking.claim` failed: share balances are frozen
+    ///      until the claim path recovers so the unsettled SQK cannot be re-split.
+    error RewardsUnsettled();
+    /// @dev The vault itself may not hold its own shares or be a reward recipient.
+    error InvalidRecipient(address to);
+    /// @dev Shares exist but the staking contract reports zero power for the vault; the NAV
+    ///      formula has no defined price, so deposits stop instead of diluting anyone.
+    error ZeroPowerWithShares(uint256 supply);
+    /// @dev `tokenId` is not owned by the vault, or is already part of the reserve.
+    error NotStranded(uint256 tokenId);
+    error RenounceDisabled();
 
     // ------------------------------------------------------------------ constructor
 
-    /// @param owner_ Vault owner (Ownable2Step). Also the initial strategist.
+    /// @param owner_ Vault owner (Ownable2Step). Also the initial strategist (see `_transferOwnership`).
     /// @param nft_ Squeek Genesis NFT collection.
     /// @param staking_ Squeekchain staking / reward contract.
     /// @param emission_ Squeekchain emission engine.
@@ -128,8 +140,6 @@ contract HamsterMiningReserve is ERC20, Ownable2Step, ReentrancyGuard, IERC721Re
         emission = ISqueekEmission(emission_);
         core = ISqueekCore(core_);
         rewardToken = IERC20(rewardToken_);
-        strategist = owner_;
-        emit StrategistUpdated(address(0), owner_);
     }
 
     // ------------------------------------------------------------------ modifiers
@@ -145,16 +155,19 @@ contract HamsterMiningReserve is ERC20, Ownable2Step, ReentrancyGuard, IERC721Re
     /// @dev Pulls each `tokenId` from msg.sender (caller must own them and have approved the vault),
     ///      stakes them under the vault's account and mints shares proportional to the power added:
     ///      first deposit: shares = deltaPower; later: shares = deltaPower * totalShares / powerBefore.
-    ///      Rewards are settled before the stake so earlier holders keep everything accrued so far.
+    ///      Rewards are settled before the stake so earlier holders keep everything accrued so far;
+    ///      if SQK is claimable but the claim fails, the deposit reverts with `RewardsUnsettled`.
     /// @return shares Shares minted to msg.sender.
     function deposit(uint256[] calldata tokenIds) external nonReentrant returns (uint256 shares) {
         uint256 n = tokenIds.length;
         if (n == 0) revert EmptyBatch();
         if (n > MAX_DEPOSIT_BATCH) revert BatchTooLarge(n, MAX_DEPOSIT_BATCH);
 
-        _settle();
+        if (!_settle()) revert RewardsUnsettled();
 
         uint256 powerBefore = staking.accountPower(address(this));
+        uint256 supply = totalSupply();
+        if (supply != 0 && powerBefore == 0) revert ZeroPowerWithShares(supply);
 
         for (uint256 i; i < n; ++i) {
             uint256 id = tokenIds[i];
@@ -170,8 +183,7 @@ contract HamsterMiningReserve is ERC20, Ownable2Step, ReentrancyGuard, IERC721Re
         if (powerAfter <= powerBefore) revert NoPowerAdded();
         uint256 deltaPower = powerAfter - powerBefore;
 
-        uint256 supply = totalSupply();
-        shares = (supply == 0 || powerBefore == 0) ? deltaPower : (deltaPower * supply) / powerBefore;
+        shares = supply == 0 ? deltaPower : (deltaPower * supply) / powerBefore;
         if (shares == 0) revert NoPowerAdded();
 
         _settledInCall = true;
@@ -189,7 +201,31 @@ contract HamsterMiningReserve is ERC20, Ownable2Step, ReentrancyGuard, IERC721Re
     /// @notice Claim the caller's pro-rata SQK and send it to `to`.
     function claimRewards(address to) external nonReentrant returns (uint256 amount) {
         if (to == address(0)) revert ZeroAddress();
+        if (to == address(this)) revert InvalidRecipient(to);
         return _claim(msg.sender, to);
+    }
+
+    /// @notice Stake Squeek NFTs that were pushed to the vault with a plain `transferFrom` (no
+    ///         receiver hook, so `onERC721Received` could not refuse them). Such tokens are owned
+    ///         by the vault but mine nothing; this puts them to work for every share holder.
+    ///         No shares are minted. Permissionless: it can only stake what the vault already owns.
+    function stakeStranded(uint256[] calldata tokenIds) external nonReentrant {
+        uint256 n = tokenIds.length;
+        if (n == 0) revert EmptyBatch();
+        if (n > MAX_DEPOSIT_BATCH) revert BatchTooLarge(n, MAX_DEPOSIT_BATCH);
+
+        uint256 powerBefore = staking.accountPower(address(this));
+        for (uint256 i; i < n; ++i) {
+            uint256 id = tokenIds[i];
+            if (isHeld[id] || nft.ownerOf(id) != address(this)) revert NotStranded(id);
+            isHeld[id] = true;
+        }
+        heldCount += n;
+        _stake(tokenIds);
+        uint256 powerAfter = staking.accountPower(address(this));
+        if (powerAfter <= powerBefore) revert NoPowerAdded();
+
+        emit StrandedStaked(msg.sender, tokenIds, powerAfter - powerBefore);
     }
 
     // ------------------------------------------------------------------ keeper actions
@@ -252,6 +288,25 @@ contract HamsterMiningReserve is ERC20, Ownable2Step, ReentrancyGuard, IERC721Re
         if (newStrategist == address(0)) revert ZeroAddress();
         emit StrategistUpdated(strategist, newStrategist);
         strategist = newStrategist;
+    }
+
+    /// @notice Disabled: the vault always needs an owner to appoint the strategist. Use the
+    ///         two-step `transferOwnership` / `acceptOwnership` instead.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
+    }
+
+    /// @dev When the strategist role still sits with the outgoing owner (the default), it moves
+    ///      with ownership, so a completed handover leaves no privilege with the old key. An
+    ///      explicitly appointed strategist is untouched. Runs from the constructor too, which is
+    ///      what makes the initial owner the initial strategist.
+    function _transferOwnership(address newOwner) internal override {
+        address previous = owner();
+        super._transferOwnership(newOwner);
+        if (strategist == previous) {
+            emit StrategistUpdated(previous, newOwner);
+            strategist = newOwner;
+        }
     }
 
     // ------------------------------------------------------------------ views
@@ -341,9 +396,11 @@ contract HamsterMiningReserve is ERC20, Ownable2Step, ReentrancyGuard, IERC721Re
     // ------------------------------------------------------------------ internals
 
     /// @dev Every balance change settles first and syncs both parties' reward accounts, so no
-    ///      transfer or mint can pick up SQK that accrued before it.
+    ///      transfer or mint can pick up SQK that accrued before it. If SQK is claimable but the
+    ///      claim fails, the balance change reverts rather than re-splitting the unsettled SQK.
     function _update(address from, address to, uint256 value) internal override {
-        if (!_settledInCall) _settle();
+        if (to == address(this)) revert InvalidRecipient(to);
+        if (!_settledInCall && !_settle()) revert RewardsUnsettled();
         if (from != address(0)) _sync(from);
         if (to != address(0)) _sync(to);
         super._update(from, to, value);
@@ -357,15 +414,24 @@ contract HamsterMiningReserve is ERC20, Ownable2Step, ReentrancyGuard, IERC721Re
     }
 
     /// @dev checkpoint + claim + index bump. The Squeekchain calls are wrapped so a paused or
-    ///      idle emission engine can never block deposits, transfers or claims.
-    function _settle() internal {
+    ///      idle emission engine never reverts here; `harvest`/`poke`/`claimRewards` ignore the
+    ///      result, while balance changes require it.
+    /// @return settled False only when the claim failed while the staking contract still reports
+    ///         claimable SQK for the vault (or cannot say): that SQK belongs to the current holders.
+    function _settle() internal returns (bool settled) {
         try emission.checkpoint() {}
         catch (bytes memory reason) {
             emit CheckpointFailed(reason);
         }
-        try staking.claim(address(this)) returns (uint256) {}
-        catch (bytes memory reason) {
-            emit ClaimFailed(reason);
+        // Raw call, return data ignored: the staking proxy is upgradeable and a `claim` that
+        // returns nothing (or anything) must not revert the vault. Accounting is balance-delta based.
+        (bool ok, bytes memory claimReason) =
+            address(staking).call(abi.encodeCall(ISqueekStaking.claim, (address(this))));
+        if (ok) {
+            settled = true;
+        } else {
+            emit ClaimFailed(claimReason);
+            settled = _nothingClaimable();
         }
 
         uint256 balance = rewardToken.balanceOf(address(this));
@@ -377,6 +443,14 @@ contract HamsterMiningReserve is ERC20, Ownable2Step, ReentrancyGuard, IERC721Re
             accountedBalance = balance;
             emit Harvested(received, rewardIndex);
         }
+    }
+
+    /// @dev True when the staking contract reports exactly zero claimable SQK for the vault. A
+    ///      reverting or malformed answer counts as "unknown", so balance changes stay frozen.
+    function _nothingClaimable() internal view returns (bool) {
+        (bool ok, bytes memory data) =
+            address(staking).staticcall(abi.encodeCall(ISqueekStaking.claimable, (address(this))));
+        return ok && data.length >= 32 && abi.decode(data, (uint256)) == 0;
     }
 
     function _claim(address holder, address to) internal returns (uint256 amount) {

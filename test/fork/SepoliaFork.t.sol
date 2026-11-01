@@ -269,6 +269,42 @@ contract SepoliaForkTest is Test {
         vault.mergeStep(a, b);
     }
 
+    function test_fork_plainPushedSqueekCanBeStakedForTheReserve() public onFork {
+        (uint256 a, uint256 b) = _twoL1();
+        vm.prank(HOLDER);
+        vault.deposit(_ids(a));
+        // The live NFT accepts a plain transferFrom to the vault (no receiver hook).
+        vm.prank(HOLDER);
+        nft.transferFrom(HOLDER, address(vault), b);
+        assertEq(nft.ownerOf(b), address(vault));
+        assertFalse(vault.isHeld(b));
+        assertEq(vault.totalPower(), L1_POWER);
+
+        uint256 supply = vault.totalSupply();
+        vm.prank(buyer);
+        vault.stakeStranded(_ids(b));
+        assertEq(vault.totalPower(), 2 * L1_POWER);
+        assertEq(vault.totalSupply(), supply);
+        assertTrue(vault.isHeld(b));
+        assertEq(nft.ownerOf(b), address(staking));
+        // It merges like any other held token.
+        vm.prank(strategist);
+        vault.mergeStep(a, b);
+        assertEq(vault.totalPower(), 2 * L1_POWER + MERGE_GAIN_L1_TO_L2);
+    }
+
+    function test_fork_vaultRejectsItselfAsRecipient() public onFork {
+        (uint256 a,) = _twoL1();
+        vm.prank(HOLDER);
+        uint256 shares = vault.deposit(_ids(a));
+        vm.prank(HOLDER);
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.InvalidRecipient.selector, address(vault)));
+        vault.transfer(address(vault), shares);
+        vm.prank(HOLDER);
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.InvalidRecipient.selector, address(vault)));
+        vault.claimRewards(address(vault));
+    }
+
     function test_fork_unsolicitedSafeTransferRejected() public onFork {
         (uint256 a,) = _twoL1();
         vm.prank(HOLDER);

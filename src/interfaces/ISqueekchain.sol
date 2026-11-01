@@ -35,7 +35,8 @@ interface ISqueekStaking {
     function deposit(address collection, uint256[] calldata ids) external;
     /// @notice Returns `ids` of `collection` to msg.sender and debits power. Free.
     function withdraw(address collection, uint256[] calldata ids) external;
-    /// @notice Pays accrued SQK to `account`.
+    /// @notice Pays accrued SQK to `account`. The live implementation returns one word; the vault
+    ///         calls it through a raw `call` and ignores the return data, so a `void` upgrade is fine.
     function claim(address account) external returns (uint256);
     function claimable(address account) external view returns (uint256);
     /// @notice Account mining power, x POWER_UNIT (1e18). L1 = 1000e18, L2 = 2200e18.

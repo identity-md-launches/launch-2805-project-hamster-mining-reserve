@@ -394,6 +394,172 @@ contract HamsterMiningReserveTest is Test {
         assertEq(vault.claimRewards(), 0);
     }
 
+    function test_settle_claimOutageWithClaimableSqkFreezesDepositsAndTransfers() public {
+        _depositL1(alice, 1);
+        staking.fund(address(vault), 100e18);
+        staking.setRevertOnClaim(true);
+
+        // Balance changes are refused while the 100 SQK cannot be pulled in.
+        vm.prank(bob);
+        vm.expectRevert(HamsterMiningReserve.RewardsUnsettled.selector);
+        vault.deposit(_ids(5));
+        vm.prank(alice);
+        vm.expectRevert(HamsterMiningReserve.RewardsUnsettled.selector);
+        vault.transfer(bob, L1_POWER);
+        vm.prank(alice);
+        vault.approve(bob, L1_POWER);
+        vm.prank(bob);
+        vm.expectRevert(HamsterMiningReserve.RewardsUnsettled.selector);
+        vault.transferFrom(alice, bob, L1_POWER);
+        assertEq(nft.ownerOf(5), bob);
+        assertEq(vault.balanceOf(alice), L1_POWER);
+
+        // Keeper and claim paths still never revert; merge is unaffected (no balance change).
+        vault.harvest();
+        vault.poke();
+        vm.prank(alice);
+        assertEq(vault.claimRewards(), 0);
+        // Even the existing holder cannot add shares while the outage lasts.
+        vm.prank(alice);
+        vm.expectRevert(HamsterMiningReserve.RewardsUnsettled.selector);
+        vault.deposit(_ids(2));
+
+        // Recovery: the deferred SQK goes to the holders of record at accrual time only.
+        staking.setRevertOnClaim(false);
+        _depositL1(bob, 5);
+        assertEq(vault.pendingRewards(alice), 100e18);
+        assertEq(vault.pendingRewards(bob), 0);
+        vm.prank(alice);
+        assertEq(vault.claimRewards(), 100e18);
+    }
+
+    function test_settle_claimOutageWithNothingClaimableDoesNotFreeze() public {
+        _depositL1(alice, 1);
+        staking.setRevertOnClaim(true);
+        // claimable == 0: nothing is at risk, so deposits and transfers go through.
+        _depositL1(bob, 5);
+        vm.prank(alice);
+        vault.transfer(bob, 1);
+        assertEq(vault.balanceOf(bob), L1_POWER + 1);
+    }
+
+    function test_settle_mergeStepStillWorksDuringClaimOutage() public {
+        vm.prank(alice);
+        vault.deposit(_ids(1, 2));
+        staking.fund(address(vault), 10e18);
+        staking.setRevertOnClaim(true);
+        vm.prank(strategist);
+        vault.mergeStep(1, 2);
+        assertEq(nft.level(1), 2);
+        staking.setRevertOnClaim(false);
+        assertEq(vault.pendingRewards(alice), 10e18);
+    }
+
+    function test_settle_voidReturningClaimDoesNotBlockVault() public {
+        staking.setVoidClaimReturn(true);
+        _depositL1(alice, 1);
+        staking.fund(address(vault), 10e18);
+        vault.harvest();
+        vm.prank(alice);
+        assertEq(vault.claimRewards(), 10e18);
+        vm.prank(alice);
+        vault.transfer(bob, L1_POWER);
+        assertEq(vault.balanceOf(bob), L1_POWER);
+        vm.prank(strategist);
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.NotHeld.selector, 2));
+        vault.mergeStep(1, 2);
+    }
+
+    function test_rewards_vaultCannotBeShareOrRewardRecipient() public {
+        _depositL1(alice, 1);
+        _depositL1(bob, 5);
+        staking.fund(address(vault), 100e18);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.InvalidRecipient.selector, address(vault)));
+        vault.claimRewards(address(vault));
+
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.InvalidRecipient.selector, address(vault)));
+        vault.transfer(address(vault), L1_POWER);
+
+        vm.prank(bob);
+        vault.approve(carol, L1_POWER);
+        vm.prank(carol);
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.InvalidRecipient.selector, address(vault)));
+        vault.transferFrom(bob, address(vault), L1_POWER);
+
+        assertEq(vault.balanceOf(address(vault)), 0);
+        assertEq(vault.pendingRewards(alice), 50e18);
+        assertEq(vault.pendingRewards(bob), 50e18);
+    }
+
+    function test_deposit_revertsWhenPowerWasZeroedUpstreamWhileSharesExist() public {
+        vm.prank(alice);
+        vault.deposit(_ids(1, 2));
+        // Upstream resets the vault's account power while 2000e18 shares are outstanding.
+        staking.setAccountPower(address(vault), 0);
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.ZeroPowerWithShares.selector, 2 * L1_POWER));
+        vault.deposit(_ids(5));
+        assertEq(nft.ownerOf(5), bob);
+        assertEq(vault.totalSupply(), 2 * L1_POWER);
+    }
+
+    function test_stakeStranded_putsPlainPushedNftToWorkWithoutShares() public {
+        _depositL1(alice, 1);
+        // Plain transferFrom invokes no receiver hook, so the vault cannot refuse it.
+        vm.prank(bob);
+        nft.transferFrom(bob, address(vault), 5);
+        assertEq(nft.ownerOf(5), address(vault));
+        assertFalse(vault.isHeld(5));
+        assertEq(vault.totalPower(), L1_POWER);
+        // The former owner can no longer deposit it, and it cannot be merged yet.
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721IncorrectOwner.selector, bob, 5, address(vault)));
+        vault.deposit(_ids(5));
+        vm.prank(strategist);
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.NotHeld.selector, 5));
+        vault.mergeStep(1, 5);
+
+        // Anyone stakes it for the reserve; no shares are minted.
+        uint256 supply = vault.totalSupply();
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit HamsterMiningReserve.StrandedStaked(carol, _ids(5), L1_POWER);
+        vm.prank(carol);
+        vault.stakeStranded(_ids(5));
+        assertEq(vault.totalSupply(), supply);
+        assertEq(vault.totalPower(), 2 * L1_POWER);
+        assertEq(vault.heldCount(), 2);
+        assertTrue(vault.isHeld(5));
+        assertEq(nft.ownerOf(5), address(staking));
+        assertEq(staking.stakerOf(5), address(vault));
+        assertEq(vault.powerPerShare(), 2e18, "stranded power accrues to existing holders");
+        // Now it merges like any held token.
+        vm.prank(strategist);
+        vault.mergeStep(1, 5);
+        assertEq(nft.level(1), 2);
+    }
+
+    function test_stakeStranded_rejectsHeldOrForeignTokens() public {
+        _depositL1(alice, 1);
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.NotStranded.selector, 1));
+        vault.stakeStranded(_ids(1));
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.NotStranded.selector, 5));
+        vault.stakeStranded(_ids(5));
+        vm.expectRevert(HamsterMiningReserve.EmptyBatch.selector);
+        vault.stakeStranded(new uint256[](0));
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.BatchTooLarge.selector, 51, 50));
+        vault.stakeStranded(new uint256[](51));
+        // A stranded token that adds no power is not absorbed.
+        vm.prank(bob);
+        nft.transferFrom(bob, address(vault), 5);
+        staking.setZeroPowerMode(true);
+        vm.expectRevert(HamsterMiningReserve.NoPowerAdded.selector);
+        vault.stakeStranded(_ids(5));
+        assertFalse(vault.isHeld(5));
+    }
+
     function test_rewards_proRataByShares() public {
         _depositL1(alice, 1);
         _depositL1(bob, 5);
@@ -568,6 +734,64 @@ contract HamsterMiningReserveTest is Test {
         vm.prank(bob);
         vault.acceptOwnership();
         assertEq(vault.owner(), bob);
+    }
+
+    function test_ownershipTransfer_movesDefaultStrategistWithOwner() public {
+        // Fresh vault: strategist defaults to the owner.
+        HamsterMiningReserve fresh = new HamsterMiningReserve(
+            owner, address(nft), address(staking), address(emission), address(core), address(sqk)
+        );
+        assertEq(fresh.strategist(), owner);
+        vm.prank(owner);
+        fresh.transferOwnership(bob);
+        assertEq(fresh.strategist(), owner, "pending transfer changes nothing");
+        vm.expectEmit(true, true, false, false, address(fresh));
+        emit HamsterMiningReserve.StrategistUpdated(owner, bob);
+        vm.prank(bob);
+        fresh.acceptOwnership();
+        assertEq(fresh.owner(), bob);
+        assertEq(fresh.strategist(), bob);
+
+        // The former owner has no privilege left.
+        vm.prank(alice);
+        nft.setApprovalForAll(address(fresh), true);
+        vm.prank(alice);
+        fresh.deposit(_ids(1, 2));
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.NotStrategist.selector, owner));
+        fresh.mergeStep(1, 2);
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, owner));
+        fresh.setStrategist(owner);
+        vm.prank(bob);
+        fresh.mergeStep(1, 2);
+        assertEq(nft.level(1), 2);
+    }
+
+    function test_ownershipTransfer_keepsExplicitStrategist() public {
+        // `vault` has an explicitly appointed strategist; a handover leaves it in place.
+        vm.prank(owner);
+        vault.transferOwnership(bob);
+        vm.prank(bob);
+        vault.acceptOwnership();
+        assertEq(vault.strategist(), strategist);
+        vm.prank(alice);
+        vault.deposit(_ids(1, 2));
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(HamsterMiningReserve.NotStrategist.selector, owner));
+        vault.mergeStep(1, 2);
+        vm.prank(strategist);
+        vault.mergeStep(1, 2);
+    }
+
+    function test_renounceOwnershipIsDisabled() public {
+        vm.prank(owner);
+        vm.expectRevert(HamsterMiningReserve.RenounceDisabled.selector);
+        vault.renounceOwnership();
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vault.renounceOwnership();
+        assertEq(vault.owner(), owner);
     }
 
     // ---------------------------------------------------------------- reentrancy

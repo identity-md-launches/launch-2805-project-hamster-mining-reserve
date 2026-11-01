@@ -121,6 +121,8 @@ contract MockStaking is IERC721Receiver {
     bool public zeroPowerMode;
     /// @dev When set, `claim` reverts: proves `harvest()` never reverts.
     bool public revertOnClaim;
+    /// @dev When set, `claim` pays SQK but returns no data (a `void` claim after a proxy upgrade).
+    bool public voidClaimReturn;
 
     constructor(MockSqueekNFT nft_, MockSQK sqk_, address mining_) {
         genesisNft = nft_;
@@ -142,6 +144,16 @@ contract MockStaking is IERC721Receiver {
 
     function setRevertOnClaim(bool v) external {
         revertOnClaim = v;
+    }
+
+    function setVoidClaimReturn(bool v) external {
+        voidClaimReturn = v;
+    }
+
+    /// @notice Overwrites an account's power. Stands in for an upstream reset, slash or
+    ///         migration of the vault's account by the upgradeable staking proxy.
+    function setAccountPower(address account, uint256 power) external {
+        accountPower[account] = power;
     }
 
     /// @notice Super-linear power curve observed on v9: L1 = 1000, L2 = 2200 (x1e18).
@@ -187,9 +199,16 @@ contract MockStaking is IERC721Receiver {
     function claim(address account) external returns (uint256 amount) {
         require(!revertOnClaim, "staking: claim disabled");
         amount = claimable[account];
-        if (amount == 0) return 0;
-        claimable[account] = 0;
-        sqk.transfer(account, amount);
+        if (amount != 0) {
+            claimable[account] = 0;
+            sqk.transfer(account, amount);
+        }
+        if (voidClaimReturn) {
+            // Return zero bytes: what a `function claim(address) external` would return.
+            assembly ("memory-safe") {
+                return(0, 0)
+            }
+        }
     }
 
     function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {

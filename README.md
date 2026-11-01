@@ -59,10 +59,24 @@ when the testnet emission clock is idle; `checkpoint()` is callable by anyone.
    - later: `shares = deltaPower * totalShares / powerBefore` (rounded down, in favour of existing holders)
 
 Because `deltaPower` is measured, not hard-coded, L2+ NFTs and future curve levels are priced
-correctly without any table in the contract. A deposit that adds no power reverts.
+correctly without any table in the contract. A deposit that adds no power reverts. If shares
+exist but the staking contract reports zero power for the vault (only possible through an
+upstream reset of the vault's account), the NAV formula has no price and `deposit` reverts with
+`ZeroPowerWithShares` rather than diluting anyone; recovery is then an explicit owner decision.
 
 Unsolicited `safeTransferFrom` of a Squeek to the vault is rejected by `onERC721Received`; the
-only way in is `deposit`.
+intended way in is `deposit`. A plain ERC-721 `transferFrom` invokes no hook and cannot be
+refused: such a Squeek is owned by the vault but not staked. Anyone may call
+`stakeStranded(uint256[] ids)` to stake tokens the vault already owns under its account. No
+shares are minted for them, so the extra power accrues to all existing holders. The pusher gets
+nothing back: the reserve is permanent.
+
+**Ordering note (by design):** shares are priced at live `accountPower`, and `mergeStep` raises
+power without minting. A deposit that lands just before a merge is priced at the pre-merge NAV
+and shares in that merge's gain; one that lands after pays the post-merge NAV. The brief's pooled
+model says merge gains accrue to every holder, so this is intended, bounded by one merge delta,
+and still requires a permanent NFT deposit. Operators who want to avoid it submit `mergeStep`
+through a private relay.
 
 ### Merge
 
@@ -78,39 +92,57 @@ blocked merge reverts atomically and leaves both tokens staked.
 `harvest()` (alias `poke()`), callable by anyone and never reverting on the Squeekchain side:
 
 1. `emission.checkpoint()` in a `try`; failure is logged as `CheckpointFailed`.
-2. `staking.claim(vault)` in a `try`; failure is logged as `ClaimFailed`.
+2. `staking.claim(vault)` through a raw `call` whose return data is ignored (the staking proxy
+   is upgradeable; a `claim` that returns nothing must not revert the vault); failure is logged
+   as `ClaimFailed`.
 3. Any SQK in the vault above `accountedBalance` is added to `rewardIndex` per share.
 
 The same settle runs **before every balance change**: every `deposit`, `transfer`,
 `transferFrom` and `claimRewards` settles first and syncs both parties, so nobody can buy or
-mint shares and pick up SQK that accrued before them. `claimRewards()` / `claimRewards(to)` pays
-a holder's pro-rata SQK and returns 0 cleanly when nothing accrued. `pendingRewards(holder)`
-previews a claim including SQK the staking contract still reports as claimable.
+mint shares and pick up SQK that accrued before them. When the claim fails **and** the staking
+contract still reports claimable SQK for the vault (or cannot answer), that SQK belongs to the
+holders of record and cannot be re-split: `deposit`, `transfer` and `transferFrom` revert with
+`RewardsUnsettled` until the claim path recovers. When the claim fails but nothing is claimable,
+balance changes proceed. `harvest`, `poke`, `claimRewards` and `mergeStep` never block on it
+(none of them changes share balances). `claimRewards()` / `claimRewards(to)` pays a holder's
+pro-rata SQK and returns 0 cleanly when nothing accrued; `to` may not be the vault itself.
+`pendingRewards(holder)` previews a claim including SQK the staking contract still reports as
+claimable.
+
+The vault refuses its own address as a share recipient (`transfer`, `transferFrom`) and as a
+reward recipient, so no SQK can be stranded on shares nobody can move.
 
 Reward amounts are deliberately **not** asserted anywhere: Sepolia emission may pay 0 per round.
 
 ### Permanent reserve
 
 There is no NFT withdrawal for anyone, depositor or owner. Exit is by transferring shares, which
-carry the future reward stream with them. There is no rescue or sweep function either.
+carry the future reward stream with them. There is no rescue or sweep function either;
+`stakeStranded` only moves NFTs the vault already owns *into* staking.
 
 ## Roles and trust assumptions
 
 | Role | Powers | Default |
 | --- | --- | --- |
-| Owner (`Ownable2Step`) | `setStrategist`, two-step ownership transfer, may call `mergeStep` | launch owner `0x2BBAD01F50EAE735F95050b62E3a7d0c4Cf8f6Ca` |
-| Strategist | `mergeStep` only; cannot move NFTs or SQK out | the owner, until `setStrategist` is called |
-| Anyone | `deposit`, `harvest`/`poke`, `claimRewards`, share transfers | |
+| Owner (`Ownable2Step`) | `setStrategist`, two-step ownership transfer, may call `mergeStep`. `renounceOwnership` is disabled. | launch owner `0x2BBAD01F50EAE735F95050b62E3a7d0c4Cf8f6Ca` |
+| Strategist | `mergeStep` only; cannot move NFTs or SQK out | the owner. While the role still sits with the owner it moves with a completed ownership transfer; an explicitly appointed strategist stays until `setStrategist` |
+| Anyone | `deposit`, `stakeStranded`, `harvest`/`poke`, `claimRewards`, share transfers | |
 
 The strategist cannot lose funds: a merge either strictly raises power or reverts, and nothing
 ever leaves the vault except SQK to its rightful claimant. A malicious or idle strategist can
-only fail to merge. The owner has no access to NFTs or SQK.
+only fail to merge. The owner has no access to NFTs or SQK. Renouncing ownership is disabled
+because the vault always needs someone able to appoint a strategist; hand over with the two-step
+transfer instead.
 
 Outside dependencies the vault trusts: the Squeekchain NFT, staking, emission and core proxies
 (upgradeable by Squeekchain, unverified on Sepolia), and SQK as a plain 18-decimal ERC-20. If the
 staking contract ever paid a fee-on-transfer or rebasing asset the balance-delta accounting still
-holds. If Squeekchain pauses or breaks `checkpoint`/`claim`, deposits, transfers and claims of
-already-received SQK keep working.
+holds. If Squeekchain pauses or breaks `checkpoint`, nothing is affected. If `claim` breaks,
+`harvest`, `claimRewards` of already-received SQK and `mergeStep` keep working; deposits and
+share transfers keep working too unless SQK is claimable but stuck, in which case they pause
+(`RewardsUnsettled`) until the claim path recovers, so that SQK reaches the holders who earned
+it. A `claim` that returns no data (a possible proxy upgrade) is handled. If the staking proxy
+ever zeroed the vault's power while shares exist, deposits stop (`ZeroPowerWithShares`).
 
 ## Constants chosen here
 
@@ -142,17 +174,23 @@ variables and `run()` refuses any chain other than Sepolia.
 
 1. **Verify the wiring**: call `graphHealth()`; expect `(10, 9, 3, true, true, true, true, true)`.
 2. **Optionally appoint a strategist**: owner calls `setStrategist(address)`. Until then the
-   owner is the strategist. The strategist is expected to run `mergeStep` whenever two held
-   Squeeks share a level and are past cooldown; `isHeld(id)` and `SqueekNFT.level(id)` tell
-   which pairs qualify.
+   owner is the strategist (and the role follows a completed ownership transfer). The strategist
+   is expected to run `mergeStep` whenever two held Squeeks share a level and are past cooldown;
+   `isHeld(id)` and `SqueekNFT.level(id)` tell which pairs qualify. Prefer a private relay for
+   `mergeStep` if front-running of the merge gain by last-second deposits matters.
 3. **Keep rewards flowing**: anyone can call `harvest()`; a keeper should call it at least once
    per emission round so `rewardIndex` tracks emission. Depositors and transfers settle on
    their own, so a missed harvest delays but never misallocates rewards.
 4. **Depositors**: `SqueekNFT.setApprovalForAll(vault, true)` then `deposit([ids])`.
-   `claimRewards()` for SQK, or transfer `hmSQUEEK` to exit.
+   `claimRewards()` for SQK, or transfer `hmSQUEEK` to exit. Never send Squeeks to the vault
+   with a plain `transferFrom`: they become part of the reserve with no shares in return.
 5. **Monitoring**: `emissionStatus()` mirrors `checkpointStatus()`; `CheckpointFailed` /
-   `ClaimFailed` events flag a paused or broken graph.
-6. **Explorer verification** of the deployed source and a separate adversarial review are the
+   `ClaimFailed` events flag a paused or broken graph. If `ClaimFailed` fires while
+   `staking.claimable(vault) > 0`, deposits and share transfers are paused (`RewardsUnsettled`)
+   until Squeekchain's claim works again; `harvest()` once it does releases them.
+6. **Stranded Squeeks**: if `SqueekNFT.ownerOf(id) == vault` and `isHeld(id)` is false, anyone
+   calls `stakeStranded([id])` so the token mines for the reserve.
+7. **Explorer verification** of the deployed source and a separate adversarial review are the
    deployer's, not this task's. Tests passing are not an audit.
 
 ## Building and testing
@@ -175,11 +213,26 @@ Fuzz tests were run with the verifier's seed
 `test/fork/SepoliaFork.t.sol` forks `https://ethereum-sepolia-rpc.publicnode.com` at block
 12038095 (falling back to the latest block if the pinned one is not served) and runs the full
 deposit → merge → claim cycle with real Squeeks owned by `0x598958Abf7d8DB8Dd468cb53DD6BA705581bFf54`
-(tokens 1-10 at level 1 at that block). When no RPC is reachable the ten on-chain tests are
+(tokens 1-10 at level 1 at that block). When no RPC is reachable the twelve on-chain tests are
 reported as **skipped**, not failed; the offline suite carries the behavioural coverage. If the
 holder later merges or moves those tokens, update `HOLDER` in the test.
 
-Last local run: 44 offline tests, 2 deploy tests and 11 fork tests passed.
+Last local run: 55 offline tests, 2 deploy tests and 13 fork tests passed.
+
+## Revision history
+
+Second round, after independent review:
+
+- `_settle()` now reports whether the claim succeeded; `deposit`, `transfer` and `transferFrom`
+  revert with `RewardsUnsettled` when SQK is claimable but the claim failed, so SQK accrued
+  before a balance change can never be re-split by it.
+- `staking.claim` is made through a raw `call` with the return data ignored, so a claim that
+  returns no data cannot brick the vault.
+- The default strategist role follows a completed ownership transfer; `renounceOwnership` reverts.
+- The vault rejects itself as share or reward recipient.
+- `deposit` reverts with `ZeroPowerWithShares` instead of minting at face value when the vault's
+  power reads zero while shares exist.
+- `stakeStranded` stakes Squeeks pushed in with a plain `transferFrom`, without minting shares.
 
 ## What is not included
 
