@@ -1,0 +1,17 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "HamsterMiningReserve",
+      "constructorArgs": [
+        "$owner",
+        "0xCB98349c134aB983dA5BfD80527dfe2552bDB70F",
+        "0x4b67b739dFd832f4EAC67a7Aa3bc244fB74cea4F",
+        "0xcd46990f8349057335289Ef282c276204B6CDC62",
+        "0x980B4424c007CAf7a1f3670B48c8EaEf7EbC3d44",
+        "0x5501E1Fa81Be1c3F49225fa7668DA0245d07Db60"
+      ]
+    }
+  ],
+  "notes": "Deploy HamsterMiningReserve on Sepolia (chain 11155111), wired directly to Squeekchain GRAPH C v9. Constructor arguments are owner, Genesis NFT, staking, emission engine, SqueekCore and existing SQK reward asset, in that order. $owner receives ownership and is the initial strategist. All five external graph contracts already exist and are not deployed by this manifest. Deposited NFTs form a permanent reserve; shares are credited only against added accountPower. hmSQUEEK is the vault's internal transferable share ledger, with no pre-created or sold shares, separate asset, pool or pair. Holders claim pro-rata SQK or transfer shares to exit. No initialization calls or deployment funding are required."
+}
